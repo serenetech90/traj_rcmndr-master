@@ -33,12 +33,13 @@ def extract_ten_dict(fdict):
 
 class nri_learned():
      n_proposals = 10
-     def __init__(self, args, sess):
+     def __init__(self, args, sess=None):
         super(nri_learned, self).__init__()
         self.args = args
         self.sess = sess
 
-        self.target_traj0_ten = tf.compat.v1.placeholder(name='target_traj0_ten', dtype=tf.float32)
+        self.target_traj0_ten = tf.Variable(initial_value=tf.zeros(shape=()), name='target_traj0_ten')
+
         # self.adj_mat_vec = tf.Variable(dtype=tf.float32, name='adj_mat_vec')
         # self.threaded_fn = Thread(target=self.h_to_a, daemon=True)
         # self.threaded_fn.start()

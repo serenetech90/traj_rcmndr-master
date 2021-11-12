@@ -19,20 +19,20 @@ class neighborhood_stat_vis_loc_encoder():
         # super(neighborhood_vis_loc_encoder, self).__init__()
         self.hidden_size = hidden_size
         self.embedding_size = embedding_size
-        self.input = tf.compat.v1.placeholder(dtype=tf.float64, shape=[obs_len, obs_len], name="inputs")
+        # self.inputs = tf.placeholder(dtype=tf.float64, shape=[obs_len, obs_len], name="inputs")
 
         # TODO: shape 4D
-        self.state_f00_b00_c = tf.compat.v1.placeholder(name='state_f00_b00_c', shape=(obs_len, self.hidden_size), dtype=tf.float64)
-        self.c_hidden_state = tf.compat.v1.placeholder(name='c_hidden_state', shape=(hidden_len, self.hidden_size), dtype=tf.float64)
+        # self.state_f00_b00_c = tf.compat.v1.placeholder(name='state_f00_b00_c', shape=(obs_len, self.hidden_size), dtype=tf.float64)
+        # self.c_hidden_state = tf.compat.v1.placeholder(name='c_hidden_state', shape=(hidden_len, self.hidden_size), dtype=tf.float64)
 
-        self.state_f00_b00_m = tf.compat.v1.placeholder(name='state_f00_b00_m', shape=(hidden_len, (grid_size * int(grid_size/2))), dtype=tf.float64)
-        self.num_freq_blocks = tf.compat.v1.placeholder(name='num_freq_blocks', dtype=tf.float32)
+        # self.state_f00_b00_m = tf.compat.v1.placeholder(name='state_f00_b00_m', shape=(hidden_len, (grid_size * int(grid_size/2))), dtype=tf.float64)
+        # self.num_freq_blocks = tf.compat.v1.placeholder(name='num_freq_blocks', dtype=tf.float32)
         self.hidden_size = hidden_size
-        self.stat_input = tf.compat.v1.placeholder(name='stat_input', shape=(dim+2, obs_len), dtype=tf.float64)
+        # self.stat_input = tf.compat.v1.placeholder(name='stat_input', shape=(dim+2, obs_len), dtype=tf.float64)
 
-        self.hidden_state = tf.compat.v1.placeholder(name='hidden_state', shape=(dim+2, self.hidden_size), dtype=tf.float64)
+        # self.hidden_state = tf.compat.v1.placeholder(name='hidden_state', shape=(dim+2, self.hidden_size), dtype=tf.float64)
 
-        self.output = tf.compat.v1.placeholder(dtype=tf.float64, shape=[hidden_len, hidden_len], name="output")
+        # self.output = tf.compat.v1.placeholder(dtype=tf.float64, shape=[hidden_len, hidden_len], name="output")
 
         self.rnn = rnn.GridLSTMCell(num_units=num_layers,
                                     feature_size=grid_size,
@@ -54,19 +54,21 @@ class neighborhood_stat_vis_loc_encoder():
                                         couple_input_forget_gates=True,
                                         reuse=tf.compat.v1.AUTO_REUSE)
 
-        self.forward()
+        # self.forward()
 
 
     def update_input_size(self, new_size):
         self.input = tf.compat.v1.placeholder(dtype=tf.float64, shape=[new_size, new_size], name="inputs")
         self.hidden_state = tf.compat.v1.placeholder(name='hidden_state', shape=(new_size, self.hidden_size), dtype=tf.float64)
 
-    def forward(self):
+    def __call__(self, *args, **kwargs):
         # Combine both features
         # hidden state should be [2 x num_nodes x rnn_size x rnn_size]
-        self.stat_output, self.stat_c_hidden_states = self.stat_rnn(self.stat_input, self.hidden_state)
-        self.output, self.c_hidden_state = self.rnn(inputs=self.input, state=self.state_f00_b00_c)
+        inputs, state_f00_b00_c, stat_input, stat_hidden_state = kwargs.values()
+        (self.stat_output, self.stat_c_hidden_states) = self.stat_rnn(stat_input, stat_hidden_state)
+        (self.output, self.c_hidden_state) = self.rnn(inputs=inputs, state=state_f00_b00_c)
 
+        return self.stat_output, self.stat_c_hidden_states, self.output, self.c_hidden_state
 
     def init_hidden(self, size):
         return tf.zeros(name='hidden_state',shape=(size, self.hidden_size), dtype=tf.float64)

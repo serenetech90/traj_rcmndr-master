@@ -292,7 +292,7 @@ class DataLoader():
 
         # self.pedIDs = self.raw_data.keys()
 
-    def read_batch(self):
+    def read_batch(self, infer=False):
 
         '''
         Function to get the next batch of trajectories
@@ -336,7 +336,7 @@ class DataLoader():
                         self.targets = {idx_c: gt_future_traj}
                     elif idx_c not in self.targets:
                         self.targets.update({idx_c: gt_future_traj})
-                    elif self.targets[idx_c].shape[0].value < self.pred_len:
+                    elif self.targets[idx_c].shape[0] < self.pred_len:
                         self.targets[idx_c] = tf.concat((self.targets[idx_c], gt_future_traj), axis=0)
             self.tick_frame_pointer(hop=self.pred_diff)
 

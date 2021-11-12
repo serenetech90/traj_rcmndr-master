@@ -27,38 +27,37 @@ class online_graph():
         # self.seq_length = args.seq_length # 1
         self.nodes = [{}]
         self.edges = [{}]
-        self.onlineGraph = Graph(self.diff)
+        self.onlineGraph = Graph(self.diff, self.pred_diff)
 
     def ConstructGraph(self, current_batch, future_traj, framenum, stateful=True, valid=False):
         self.onlineGraph.step = framenum
 
         if valid:
-            for pedID, pos in current_batch.items():
+            for pedID, itr in enumerate(current_batch):
                 node_id = pedID
-                node_pos_list = {}
-                node_pos_list[framenum] = [pos]
-
+                node_pos_list = current_batch[pedID][int(framenum*self.ratio):int(framenum*self.ratio) + self.diff]  # * self.diff
                 node = Node(node_id, node_pos_list)
-                if framenum > 0 and framenum % 8:
-                    node.setTargets(seq=future_traj[pedID])
-                self.onlineGraph.setNodes(framenum, node)
+                # if framenum > 0 and framenum % 8:
+                #     node.setTargets(seq=future_traj[pedID])
+                self.onlineGraph.setNodes(itr, node)
         else:
-            self.pos_list_len = len(current_batch['coords'])
-            for idx, itr in enumerate(current_batch['coords']):
+            self.pos_list_len = len(current_batch)
+            for idx, itr in enumerate(current_batch):
             # for idx, itr in enumerate(current_batch['track_id']):
                 try:
-                    node_pos_list = current_batch['coords'][idx][int(framenum*self.ratio):int(framenum*self.ratio) + self.diff]  # * self.diff
+                    node_pos_list = current_batch[idx][int(framenum*self.ratio):int(framenum*self.ratio) + self.diff]  # * self.diff
                     node_id = pedID = idx #current_batch['track_id']
                     node = Node(node_id, node_pos_list)
-                    try:
-                        if future_traj[pedID].shape[0] < 1:
-                            node.setTargets(seq=future_traj[pedID][0:self.pred_diff])
-                        elif future_traj[pedID][framenum:framenum + self.pred_diff].shape[0] < self.pred_diff:
-                            node.setTargets(future_traj[pedID])
-                        else:
-                            node.setTargets(seq=future_traj[pedID][framenum:framenum + self.pred_diff])
-                    except KeyError:
-                        continue
+                    if not valid:
+                        try:
+                            if future_traj[pedID].shape[0] < 1:
+                                node.setTargets(seq=future_traj[pedID][0:self.pred_diff])
+                            elif future_traj[pedID][framenum:framenum + self.pred_diff].shape[0] < self.pred_diff:
+                                node.setTargets(future_traj[pedID])
+                            else:
+                                node.setTargets(seq=future_traj[pedID][framenum:framenum + self.pred_diff])
+                        except KeyError:
+                            continue
                     self.onlineGraph.setNodes(itr, node)
                 except KeyError:
                     key = list(current_batch.keys())
@@ -89,7 +88,7 @@ class online_graph():
         pass
 
 class Graph(nx.Graph):
-    def __init__(self, diff):
+    def __init__(self, diff, pred_diff):
         super(Graph, self).__init__()
         self.adj_mat = []
         self.dist_mat = []
@@ -99,6 +98,7 @@ class Graph(nx.Graph):
         self.Stateful = True
         self.step = 0
         self.diff = diff
+        self.pred_diff = pred_diff
 
         # by default the graph is stateful and each graph segment is connected to the previous temporal segment
         # unless nodes in a graph no longer exist in the scene, then we need to disconnect and destroy variables
@@ -116,12 +116,13 @@ class Graph(nx.Graph):
             except IndexError:
                 pass
         else:
+            r_target = tf.repeat(input=node.targets[0][-1], repeats=(abs(len(node.targets[0]) - self.pred_diff)), axis=0)
             self.add_node(node.id,
                           seq=node.seq,
-                          node_pos_list=tf.concat((node.pos, tf.zeros(shape=(abs(node.pos.shape[0].value - self.diff), 2))), axis=0), #len(node.pos)
+                          node_pos_list=tf.concat((node.pos, tf.zeros(shape=(abs(node.pos.shape[0] - self.diff), 2))), axis=0), #len(node.pos)
                           state=node.state,
                           cell=node.cell,
-                          targets=node.targets,
+                          targets=tf.concat((node.targets[0], tf.reshape(r_target, (int(len(r_target)/2),2))), axis=0),
                           vel=node.vel)
 
     def setEdges(self, framenum , obj ,u,v=None, mode='t'):

@@ -14,7 +14,7 @@ class TrajectoryDataset(Dataset):
         self.mainpath = os.path.join(mainpath, part)
         self.names = sorted(os.listdir(self.mainpath))
         self.obs = 20
-        self.preds = 20 #80
+        self.preds = 80
         self.total = self.obs+self.preds
         if self.part=='test':
             self.total = self.obs

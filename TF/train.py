@@ -5,12 +5,15 @@ import sys
 import psutil
 import logging
 # from models import g2k_lstm_mcr as mcr
-
+from torch.utils.data import DataLoader
 import networkx_graph as nx_g
 import load_traj as load
 import tensorflow as tf
+import json
+import re
+from tqdm import tqdm
 import helper
-from torch.utils.data import dataloader
+# from torch.utils.data import dataloader
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -45,10 +48,31 @@ FORMAT = '[%(levelname)s: %(filename)s: %(lineno)4d]: %(message)s'
 logging.basicConfig(level=logging.WARNING, format=FORMAT, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
+# print(tf.executing_eagerly())
+# print(tf.config.experimental_functions_run_eagerly())
 
-def loss(l2norm_vec):
-    return tf.nn.l2_loss(t=l2norm_vec, name='loss')
 
+def train(args):
+
+    # tf.config.run_functions_eagerly(True)
+    out_graph = tf.Graph()
+    # tf.compat.v1.enable_v2_behavior()
+    # tf.compat.v1.enable_eager_execution()
+    # with out_graph.as_default():
+    #     tf.compat.v1.enable_eager_execution()
+    #     tf.config.run_functions_eagerly(True)
+    #     print(tf.version.VERSION)
+    print(tf.executing_eagerly())
+    # print(tf.config.experimental_functions_run_eagerly())
+    STRGGRNN_model_train(out_graph, args, infer=0)
+
+    # out_graph.close()
+
+def main():
+    # sys.argv = ['-f']
+    args = parse.ArgsParser()
+    train(args.parser.parse_args())
+    return
 
 # TODO use glstm to predict path along with neighborhood boundaries using inner estimated soft attention mechanism.
 # take relative distance + orthogonality between people vislets (biased by visual span width)
@@ -56,122 +80,111 @@ def loss(l2norm_vec):
 # then transform using mlp the new hidden states mixture into (x,y) euclidean locations.
 
 
-def evaluate(params, n_proposals, i, i0):
+def evaluate(params, n_proposals, i):
     ade_tmp, final_tmp, pred_tmp = [], [], []
 
-    def condition(pred_len, num_nodes_sc, num_nodes,
-                  target_traj, pred_path, euc_loss, fde, num_end_targets, euc_min, euc_idx, i, i0):
+    def condition(i, num_nodes_sc, target_traj, pred_path,
+                      euc_loss, fde, num_end_targets):
         return tf.less(i, num_nodes_sc)
 
-    def inner_loop_fn(pred_len, num_nodes_sc, num_nodes, target_traj, pred_path,
-                      euc_loss, fde, num_end_targets, euc_min, euc_idx, i, i0):
+    @tf.function
+    def inner_loop_fn(i, num_nodes_sc, target_traj, pred_path,
+                      euc_loss, fde, num_end_targets):
         try:
             euc_loss = tf.subtract(target_traj, tf.add(pred_path, target_traj))
-            # euc_loss = rel_future_path - target_traj
             fde = tf.subtract(target_traj[:, -1, :], tf.add(pred_path[:, -1, :], target_traj[:, -1, :]))
 
         except KeyError:
             print('Key Error inside loop')
             pass
+
         i = tf.add(i, 1)
         num_end_targets = tf.add(num_end_targets, 1)
 
-        return pred_len, num_nodes_sc, num_nodes, \
-               target_traj, pred_path, euc_loss, fde, num_end_targets, \
-               euc_min, euc_idx, i, i0
+        return i, num_nodes_sc, \
+               target_traj, pred_path, euc_loss, fde, num_end_targets
 
-    pred_len, num_nodes_sc, num_nodes, target_traj, pred_path, \
-    euc_loss, fde, num_end_targets, euc_min, euc_idx = params
+    num_nodes_sc, target_traj, pred_path, \
+    euc_loss, fde, num_end_targets = params
 
-    # print('target_traj = ', target_traj)
-    # print('pred_path = ', pred_path)
     for k in range(n_proposals):
-        p = pred_path[k][0:target_traj.shape[0].value]
-        # target_traj0_var = tf.convert_to_tensor(value=target_traj)
+        p = pred_path[k][0:len(target_traj)] # pred_path[k][0:target_traj.shape[0]]
         pred_path_var = tf.convert_to_tensor(value=p)
 
-        loop_vars = [pred_len, num_nodes_sc,
-                     num_nodes, target_traj, pred_path_var, euc_loss, fde,
-                     num_end_targets, euc_min, euc_idx, i, i0]
-        # shapes = [pred_len.get_shape(), num_nodes_sc.get_shape(),
-        #           tf.TensorShape([]),
-        #           tf.TensorShape([None, 20, 2]), tf.TensorShape([None, 20, 2]),
-        #           euc_loss.get_shape(), fde.get_shape(), num_end_targets.get_shape(),
-        #           euc_min.get_shape(), euc_idx.get_shape(), i.get_shape(), i0.get_shape()]
+        loop_vars = [i, num_nodes_sc,
+                     target_traj, pred_path_var, euc_loss, fde,
+                     num_end_targets]
 
-        pred_len, num_nodes_sc, num_nodes, \
-        target_traj, _, euc_loss, fde, num_end_targets, \
-        euc_min, euc_idx, i, i0 = \
-            tf.while_loop(cond=condition, body=inner_loop_fn, loop_vars=loop_vars, parallel_iterations=n_proposals)
+        i, num_nodes_sc, \
+        target_traj, _, euc_loss, fde, num_end_targets = tf.while_loop(cond=condition, body=inner_loop_fn, loop_vars=loop_vars,
+                                                                       parallel_iterations=n_proposals)
 
         ade_tmp.append(euc_loss)
         final_tmp.append(fde)
     return tf.stack(ade_tmp), tf.stack(final_tmp)
 
 
-def assess_rcmndr(sess, graph_t, pred_len, num_nodes, batch_len, euc_loss, fde, pred_path,
-                  target_traj0_ten, model, attn=None, hidden_state=None, n_proposals=10):
-
+@tf.function
+def assess_rcmndr(pred_len, num_nodes, pred_path, target_traj0_ten, model,  n_proposals=10):
+    tf.config.run_functions_eagerly(True)  # run tf function decorator and its operations without session
     pred_path = tf.transpose(a=pred_path, perm=(0, 3, 2, 1))
-
-    i0 = tf.zeros(shape=())
-    pred_len0 = tf.convert_to_tensor(value=pred_len)
     i = tf.zeros(shape=(), dtype=tf.float32)
     num_nodes0 = tf.convert_to_tensor(num_nodes, dtype=tf.float32)
-    # hidden_state0 = tf.convert_to_tensor(hidden_state)
     num_end_targets = tf.zeros(shape=())
-    euc_min = tf.convert_to_tensor(np.inf, dtype=tf.float32)
-    euc_idx = tf.zeros(shape=(1), dtype=tf.float32)
+    euc_loss = tf.zeros((num_nodes, pred_len, 2), dtype=np.float32)
+    fde = tf.zeros((num_nodes, 2), dtype=np.float32)
 
-    euc_loss = np.zeros((num_nodes, pred_len, 2), dtype=np.float32)
-    fde = np.zeros((num_nodes, 2), dtype=np.float32)
+    params = [num_nodes0, target_traj0_ten, pred_path, euc_loss, fde, num_end_targets]
 
-    euc_loss0 = tf.convert_to_tensor(euc_loss)
-    fde0 = tf.convert_to_tensor(fde)
-
-    params = [pred_len0, num_nodes0, num_nodes, target_traj0_ten, #tf.convert_to_tensor(target_traj0_ten), tf.convert_to_tensor(pred_path)
-              pred_path, euc_loss0,  # euc_loss0, fde0
-              fde0, num_end_targets, euc_min, euc_idx]
-
-    ade_losses, fde_loss = evaluate(params, n_proposals, i, i0)
-
-    ade_stack = tf.linalg.norm(ade_losses, axis=3)
+    ade_losses, fde_loss = evaluate(params, n_proposals, i)
     # ade_losses = tmp/pred_len # / num_nodes  # (len(euc_loss) * batch_len)
-    model.ade_stack = tf.reduce_mean(tf.reduce_mean(ade_stack, axis=2), axis=1)
-    ade_min_idx = tf.argmin(model.ade_stack)
-    ade_loss_final = tf.reduce_min(model.ade_stack)
+    ade_stack = tf.linalg.norm(ade_losses, axis=3)
+    ade_stack = tf.reduce_mean(ade_stack, axis=2) #[:int(pred_len/2)]
+    ade_stack = tf.reduce_mean(ade_stack, axis=1)
+    # ade_stack = tf.reduce_mean(ade_losses, axis=2)
+    # ade_stack = tf.linalg.norm(ade_stack, axis=2)
+    # ade_stack = tf.reduce_mean(ade_stack, axis=1)
+
+    # print(tf.compat.v2.executing_eagerly())
+
+    model.ade_op.assign(ade_stack, use_locking=True, read_value=False, name='ass_ade_op')
+    ade_min_idx = tf.Variable(tf.argmin(model.ade_op.read_value()))
+    ade_loss_final = tf.reduce_min(model.ade_op.read_value())
     fde_loss = tf.reduce_min(tf.reduce_mean(tf.linalg.norm(fde_loss, axis=2), axis=1)) #/ num_nodes
 
     # TODO pick minimum then optimize
-    return ade_loss_final, fde_loss, ade_min_idx
+    return ade_loss_final, fde_loss, ade_min_idx.read_value()
 
 
-def l2loss(err):
-    return tf.nn.l2_loss(t=err, name='loss')
-
-
-def STRGGRNN_model_train(out_graph, args):
+def STRGGRNN_model_train(out_graph, args, infer=0):
 # with tf.compat.v1.Session(graph=out_graph).as_default() as out_sess:
+# with tf.compat.v1.Session(graph=out_graph).as_default() as sess:
 
-    with tf.compat.v1.Session(graph=out_graph).as_default() as sess:
+    parent_dir = '/home/sisi/Documents/Sirius_challenge/'
+    summary_logdir = parent_dir + 'traj_rcmndr-master/TF/data/train/TBX'
+    tboard_summary = TX.SummaryWriter(logdir=summary_logdir)
 
-        parent_dir = '/home/sisi/Documents/Sirius_challenge/'
-        summary_logdir = parent_dir + 'traj_rcmndr-master/TF/data/train/TBX'
-        tboard_summary = TX.SummaryWriter(logdir=summary_logdir)
-        # os.system("tensorboard --logdir={}".format(summary_logdir))
+    log_count_f = open(parent_dir + 'log/strggrnn_counts.txt', 'w')
+    log_dir = open(parent_dir + 'log/strggrnn_ade_log_kfold.csv', 'w')
+    log_dir_fde = open(parent_dir + 'log/strggrnn_fde_log_kfold.csv', 'w')
+    save_dir = parent_dir + 'save/'
 
-        pid = psutil.Process(os.getpid())
-        train_loader = load.DataLoader(args=args, path=parent_dir + 'traj_rcmndr-master/TF/data/',
-                                       leave=args.leaveDataset)
-        time_log = open(os.path.join(parent_dir, train_loader.used_data_dir, 'training_Tlog.txt'), 'w')
-        log_count_f = open(parent_dir + 'log/strggrnn_counts.txt', 'w')
-        log_dir = open(parent_dir + 'log/strggrnn_ade_log_kfold.csv', 'w')
-        log_dir_fde = open(parent_dir + 'log/strggrnn_fde_log_kfold.csv', 'w')
-        save_dir = parent_dir + 'save/'
+    pid = psutil.Process(os.getpid())
+    train_loader = load.DataLoader(args=args, path=parent_dir + 'traj_rcmndr-master/TF/data/',
+                                   leave=args.leaveDataset)
+    # time_log = open(os.path.join(parent_dir, train_loader.used_data_dir, 'training_Tlog.txt'), 'w')
 
-        # TODO implement k-fold cross validation + check why pred_path is all zeros (bug in GridLSTMCell)
-        graph = nx_g.online_graph(args)
-
+    graph = nx_g.online_graph(args)
+    # K-Fold cross validation scheme
+    if not infer:
+        # train_data = TrajectoryDataset(parent_dir + 'Sirius_json', 'train') # 'traj_rcmndr-master/TF/data/', 'train'
+        # train_loader = DataLoader(
+        #     dataset=train_data,
+        #     batch_size=32, #args.batch_size,
+        #     num_workers=2,
+        #     collate_fn=torch_collate_fn,
+        #     shuffle=True,
+        # )
         # print(train_loader.sel_file)
         train_loader.reset_data_pointer()
         flag = True
@@ -185,167 +198,317 @@ def STRGGRNN_model_train(out_graph, args):
         batch = {}
 
         # opt_op = loss_optzr.minimize(loss=loss, var_list=l2norm_vec, name='loss_optzr')
-
+        best_val = 100
         while e < args.num_epochs:
             e_start = time.time()
-            # train_data = TrajectoryDataset(parent_dir + 'traj_rcmndr-master/TF/data/', 'train') #'Sirius_json', 'train')
-            # train_loader = train_loader(
-            #     train_data,
-            #     batch_size=args.batch_size,
-            #     num_workers=2,
-            #     collate_fn=torch_collate_fn,
-            #     shuffle=True,
-            # )
+            print('Epoch Started = ', e)
+            print('                  ############################################                       ')
             # train_loader.rl_num_nodes = train_data.total
-            train_loader = train_loader
+            # train_loader = train_loader
             gt_traj, future_traj, _ = train_loader.read_batch()
             batch["coords"] = list(gt_traj.values())
             batch["future_coords"] = list(future_traj.values())
 
-            print('session started at Epoch = ', e)
-
             # for batch_idx, btraj in enumerate(train_loader):
-            for batch_idx in range(args.batch_size):
-                start_all = time.time()
 
-                rcmndr_start = time.time()
-                data_loader = {'train_loaderobj': train_loader, 'batch': batch}
-
-                # model = strggrnn(inputs=[args, out_graph, graph, out_sess, data_loader, train_loader.frame_pointer])
-                model = strggrnn(inputs=[args, out_graph, graph, sess, data_loader, (batch_idx * args.pred_len)])
-                model.fit()
-                tf.compat.v1.get_default_graph().get_collection(name='variables', scope='krnl_weights').clear()
-
-                train_loader.tick_frame_pointer(hop=args.gt_frame_hop)
-                ade_bst, fde_bst, min_idx = assess_rcmndr(sess, out_graph, args.pred_len,
-                                                          train_loader.rl_num_nodes, model.rl_num_nodes, total_ade,
-                                                          total_fde, model.all_pred_path, model.nri_obj.target_traj0_ten,
-                                                          model=model, n_proposals=model.nri_obj.n_proposals)
-                np_ade_bst = ade_bst.eval()
-                np_fde_bst = fde_bst.eval()
-
-                if e == 0:
+            try:
+                # enum_traj = enumerate(train_loader)
+                # for batch_idx, batch in enum_traj:
+                for batch_idx in range(args.batch_size):
                     # tf.compat.v1.initialize_all_variables().run(session=sess)
-                    loss_optzr = tf.compat.v1.train.GradientDescentOptimizer(learning_rate=args.learning_rate)
+                    # loss_optzr = tf.compat.v1.train.GradientDescentOptimizer(learning_rate=args.learning_rate)
                     # loss_optzr.minimize(loss=model.l2loss, var_list=model.l2norm_vec, name='loss_optzr')
+                    print('#################  Batch Started = ', batch_idx+1, '#################')
+                    start_all = time.time()
+                    rcmndr_start = time.time()
+                    cust_dataloader = {'train_loaderobj': train_loader, 'batch': batch}
+                    # train_loader.rl_num_nodes = len(batch['coords'])
+                    # model = strggrnn(inputs=[args, out_graph, graph, out_sess, data_loader, train_loader.frame_pointer])
+                    model = strggrnn(inputs=[args, out_graph, graph, cust_dataloader, (batch_idx * args.pred_len), False])
+                    if e == 0 and batch_idx == 0:
+                        loss_optzr = tf.keras.optimizers.SGD(learning_rate=args.learning_rate)
+                        @tf.function
+                        def _l2loss():
+                            return tf.nn.l2_loss(t=model.l2norm_vec, name='loss')
 
-                # preds = torch.tensor(model.all_pred_path[0])
-                # preds = preds.permute(2, 1, 0)
-                # preds = torch.add(preds, torch.tensor(model.nri_obj.target_traj0_ten.eval()))
-                # num_of_agents = model.rl_num_nodes
-                # total_ade[0] += num_of_agents * torch.mean(
-                #     F.pairwise_distance(preds[:, :20].contiguous().view(-1, 2),
-                #                         batch['future_coords'][:, :20].contiguous().view(-1, 2))).item()
-                # total_ade[1] += num_of_agents * torch.mean(
-                #     F.pairwise_distance(preds[:, :40:2].contiguous().view(-1, 2),
-                #                         batch['future_coords'][:, :40:2].contiguous().view(-1, 2))).item()
-                # total_ade[2] += num_of_agents * torch.mean(
-                #     F.pairwise_distance(preds[:, :80:4].contiguous().view(-1, 2),
-                #                         batch['future_coords'][:, :80:4].contiguous().view(-1, 2))).item()
+                        # checkpoint_path = os.path.join(save_dir, 'strggrnn_train_{0}.ckpt'.format(e))
+                        ckpt = tf.train.Checkpoint(step=tf.Variable(1), optimizer=loss_optzr, model=model, root=model)
+                        ckpt_saver = tf.train.CheckpointManager(ckpt, save_dir, checkpoint_name="ggrnn_train", max_to_keep=None)
 
-                # total_fde[0] += torch.sum(F.pairwise_distance(preds[:, 19].reshape(-1, 2),
-                #                                               batch['future_coords'][:, 19].reshape(-1, 2))).item()
+                    model.fit()
 
-                # num_nodes += num_of_agents
-                # total_fde[1] += torch.sum(F.pairwise_distance(preds[:, 39].reshape(-1, 2),
-                #                                               batch['future_coords'][:, 39].reshape(-1, 2))).item()
-                # total_fde[2] += torch.sum(F.pairwise_distance(preds[:, 79].reshape(-1, 2),
-                #                                               batch['future_coords'][:, 79].reshape(-1, 2))).item()
+                    # tf.compat.v1.get_default_graph().get_collection(name='variables', scope='krnl_weights').clear()
 
-                rcmndr_end = time.time()
-                # print('\n time taken to recommend best adjacency proposal: {}\n'.format(rcmndr_end - rcmndr_start))
+                    # train_loader.tick_frame_pointer(hop=args.gt_frame_hop)
 
-                # ade_losses = euc_min / (model.nri_obj.n_proposals * args.pred_len)
-                # fde_min = tf.reduce_min(fde_min)
-                # min_idx = tf.argmin(ade_losses)
-                #
-                # ade_min = tf.reduce_min(ade_losses)
+                    eager_assess = tf.function(assess_rcmndr)
+                    tf.config.run_functions_eagerly(True)
+                    # print(tf.compat.v2.executing_eagerly())
+                    ade_bst, fde_bst, min_idx = eager_assess(args.pred_len,
+                                                              model.rl_num_nodes, model.all_pred_path,
+                                                              model.nri_obj.target_traj0_ten,
+                                                              model=model, n_proposals=model.nri_obj.n_proposals)
+                    np_ade_bst = ade_bst.numpy()
+                    np_fde_bst = fde_bst.numpy()
+                    # preds = torch.tensor(model.all_pred_path[0].numpy())
+                    # preds = preds.permute(2, 1, 0)
+                    # t_gt_future = torch.tensor(model.nri_obj.target_traj0_ten.numpy())
+                    # preds = torch.add(preds[:len(t_gt_future)], t_gt_future)
+                    # num_of_agents = model.rl_num_nodes
+                    # total_ade[0] += num_of_agents * torch.mean(
+                    #     F.pairwise_distance(preds[:, :20].contiguous().view(-1, 2),
+                    #                         batch['future_coords'][:, :20].contiguous().view(-1, 2))).item()
+                    # total_ade[1] += num_of_agents * torch.mean(
+                    #     F.pairwise_distance(preds[:, :40:2].contiguous().view(-1, 2),
+                    #                         batch['future_coords'][:, :40:2].contiguous().view(-1, 2))).item()
+                    # total_ade[2] += num_of_agents * torch.mean(
+                    #     F.pairwise_distance(preds[:, :80:4].contiguous().view(-1, 2),
+                    #                         batch['future_coords'][:, :80:4].contiguous().view(-1, 2))).item()
+                    #
+                    # total_fde[0] += torch.sum(F.pairwise_distance(preds[:, 19].reshape(-1, 2),
+                    #                                               batch['future_coords'][:, 19].reshape(-1, 2))).item()
+                    #
+                    # num_nodes += num_of_agents
+                    # total_fde[1] += torch.sum(F.pairwise_distance(preds[:, 39].reshape(-1, 2),
+                    #                                               batch['future_coords'][:, 39].reshape(-1, 2))).item()
+                    # total_fde[2] += torch.sum(F.pairwise_distance(preds[:, 79].reshape(-1, 2),
+                    #                                               batch['future_coords'][:, 79].reshape(-1, 2))).item()
 
-                # bst_adj_prop = model.nri_obj.adj_mat_vec[min_idx.eval()]
-                # print('Short ADE', total_ade[0] / num_nodes)
-                # print('Short ADE', total_fde[0] / num_nodes)
-                print('ADE = ', np_ade_bst)
-                print('FDE = ', np_fde_bst)
+                    rcmndr_end = time.time()
+                    # print('\n time taken to recommend best adjacency proposal: {}\n'.format(rcmndr_end - rcmndr_start))
 
-                # nri_obj.l2norm_vec = tf.Variable(tf.convert_to_tensor(euc_min))
-                # TODO: think about optimizing at each prediction or optimizing after batch
-                start = time.time()
-                model.l2norm_vec.assign(ade_bst, use_locking=True, read_value=False, name='ass_l2norm').run()
-                # tf.Tensor(op=assign_op, value_index=0, dtype=tf.float32)
-                loss_optzr.minimize(loss=model.l2norm_vec.read_value(), #var_list=[out_graph.get_collection('trainable_variables')],
-                                    name='loss_optzr')
-                loss = model.l2loss().eval()
+                    # ade_losses = euc_min / (model.nri_obj.n_proposals * args.pred_len)
+                    # fde_min = tf.reduce_min(fde_min)
+                    # min_idx = tf.argmin(ade_losses)
+                    #
+                    # ade_min = tf.reduce_min(ade_losses)
 
-                print('Loss = ', loss)
-                tboard_summary.add_scalar(tag='ADE', scalar_value=np_ade_bst, global_step=e*batch_idx)
-                tboard_summary.add_scalar(tag='Loss', scalar_value=loss, global_step=e*batch_idx)
-                # loss_optzr.run()
-                # sess.run(loss_optzr)#, feed_dict={l2norm_vec: euc_disp})
-                print('BackPropagation with SGD took:{}'.format(time.time()-start))
+                    # bst_adj_prop = model.nri_obj.adj_mat_vec[min_idx.eval()]
+                    # print('Short ADE', total_ade[0] / num_nodes)
+                    # print('Short ADE', total_fde[0] / num_nodes)
+                    print('ADE = ', np_ade_bst)
+                    print('FDE = ', np_fde_bst)
 
-                # model.krnl_mdl.hidden_states = tf.matmul(bst_adj_prop, model.hidden_state)
-                # model.krnl_mdl.hidden_states = tf.nn.softmax(model.krnl_mdl.hidden_states)
-                # make it stateful when batch_size is small enough to find trajectories
-                # related to each other between 2 consecutive batches .
-                # model.hidden_state = model.krnl_mdl.hidden_states
-                num_targets += model.rl_num_nodes
+                    # nri_obj.l2norm_vec = tf.Variable(tf.convert_to_tensor(euc_min))
+                    # TODO: think about optimizing at each prediction or optimizing after batch
+                    start = time.time()
+                    model.l2norm_vec.assign(ade_bst, use_locking=True, read_value=False, name='ass_l2norm')
+                    # tf.Tensor(op=assign_op, value_index=0, dtype=tf.float32)
+                    # l2loss = lambda : tf.nn.l2_loss(t=model.l2norm_vec.read_value(), name='loss')
+                    loss_optzr.minimize(loss=_l2loss, var_list=[model.l2norm_vec],
+                                        name='optzr_min_op')
+                    loss = model.l2norm_vec.read_value().numpy()
 
-                print('\nFull pipeline time =', time.time() - start_all)
-                time_log.write('{0},{1},{2}\n'.format(e, time.time() - model.start_b,
-                               (pid.memory_info().rss / 1024 / 1024 / 1024)))
+                    print('Loss = ', loss)
+                    tboard_summary.add_scalar(tag='ADE', scalar_value=np_ade_bst, global_step=e*batch_idx)
+                    tboard_summary.add_scalar(tag='Loss', scalar_value=loss, global_step=e*batch_idx)
+                    # loss_optzr.run()
+                    # sess.run(loss_optzr)#, feed_dict={l2norm_vec: euc_disp})
+                    print('BackPropagation with SGD took:{}'.format(time.time()-start))
 
-                log_dir.write('{0},{1}\n'.format(e, np_ade_bst))
-                log_dir_fde.write('{0},{1}\n'.format(e, np_fde_bst))
+                    # model.krnl_mdl.hidden_states = tf.matmul(bst_adj_prop, model.hidden_state)
+                    # model.krnl_mdl.hidden_states = tf.nn.softmax(model.krnl_mdl.hidden_states)
+                    # make it stateful when batch_size is small enough to find trajectories
+                    # related to each other between 2 consecutive batches .
+                    # model.hidden_state = model.krnl_mdl.hidden_states
+                    num_targets += model.rl_num_nodes
 
-                tboard_summary.add_scalar(tag='RAM used', scalar_value=pid.memory_info().rss / 1024 / 1024 / 1024)
-                tboard_summary.flush()
+                    print('\nFull pipeline time =', time.time() - start_all)
+                    # time_log.write('{0},{1},{2}\n'.format(e, time.time() - model.start_b,
+                    #                (pid.memory_info().rss / 1024 / 1024 / 1024)))
 
-                print('============================')
-                print("Memory used: {:.2f} GB".format(pid.memory_info().rss / 1024 / 1024 / 1024))
-                print('============================')
+                    # log_dir.write('{0},{1}\n'.format(e, np_ade_bst))
+                    # log_dir_fde.write('{0},{1}\n'.format(e, np_fde_bst))
 
-                end_t = time.time()
-                logger.warning('{0} seconds to complete'.format(end_t - model.start_t))
-                logger.warning('Batch = {3} of {4} Frame {0} Loss = {1}, num_ped={2}'
-                               .format(train_loader.frame_pointer, loss, model.rl_num_nodes, batch_idx,
-                                       args.batch_size)) #len(train_loader)
+                    tboard_summary.add_scalar(tag='RAM used', scalar_value=pid.memory_info().rss / 1024 / 1024 / 1024)
+                    tboard_summary.flush()
 
-            if (e * batch_idx) % args.save_every == 0: #e % args.save_every == 0 and
-                print('Saving model at epoch {0}'.format( e))
-                checkpoint_path = os.path.join(save_dir, 'strggrnn_train_{0}.ckpt'.format(e))
-                saver = tf.compat.v1.train.Saver(out_graph.get_collection('trainable_variables')) #tf.compat.v1.all_variables())
-                saver.save(sess, checkpoint_path, global_step=e * batch_idx)
+                    print('============================')
+                    print("Memory used: {:.2f} GB".format(pid.memory_info().rss / 1024 / 1024 / 1024))
+                    print('============================')
 
-                print("model saved to {}".format(checkpoint_path))
+                    end_t = time.time()
+                    logger.warning('{0} seconds to complete'.format(end_t - model.start_t))
+                    # logger.warning('Batch = {3} of {4} Frame {0} Loss = {1}, num_ped={2}'
+                    #                .format(train_loader.frame_pointer, loss, model.rl_num_nodes, batch_idx,
+                    #                        args.batch_size)) #len(train_loader)
 
+                    if (e * batch_idx) and (e * batch_idx) % args.save_every == 0 : #e % args.save_every == 0 and and (e * batch_idx) == 5
+                        # batch.pop("coords")
+                        # batch.pop("future_coords")
+                        # del batch
+                        print('Saving model at epoch {0}'.format(e))
+                        ckpt.step.assign_add(1)
+                        ckpt_saver.save(checkpoint_number=(e * batch_idx))
+                        print("model saved to {}".format(save_dir))
+            except TypeError:
+                pass
             e += 1
             e_end = time.time()
 
             print('Epoch time taken: {}'.format(e_end - e_start))
             log_count_f.write('ADE steps {0}\nFDE steps = {1}'.format(num_targets, num_end_targets))
-    # log_f.close()
-    sess.close()
-    time_log.close()
-    log_count_f.close()
-    log_dir.close()
-    log_dir_fde.close()
+            ckpt_saver = tf.train.CheckpointManager(ckpt, save_dir, checkpoint_name="ggrnn_best_val", max_to_keep=None)
+            # val_loader = load.DataLoader(args=args, path=parent_dir + 'traj_rcmndr-master/TF/data/',
+            #                                leave=args.leaveDataset)
+            # Validation step
+            # val_data = TrajectoryDataset(parent_dir + 'Sirius_json', 'val')
+            # val_loader = DataLoader(
+            #     val_data,
+            #     batch_size=64,
+            #     num_workers=2,
+            #     collate_fn=torch_collate_fn,
+            #     shuffle=False,
+            # )
+
+            # Check for invalid Json data:
+            try:
+                val_loader = load.DataLoader(args=args, path=parent_dir + 'traj_rcmndr-master/TF/data/',
+                                               leave=args.leaveDataset, infer=True)
+                gt_traj, future_traj, _ = val_loader.read_batch()
+                batch["coords"] = list(gt_traj.values())
+                batch["future_coords"] = future_traj.values()
+                # enum_traj = enumerate(val_loader)
+                # for batch_idx, batch in enum_traj:
+                for batch_idx in range(args.batch_size):
+                    cust_dataloader = {'train_loaderobj': val_loader, 'batch': batch}
+
+                    # data_loader = {'train_loaderobj': cust_dataloader, 'batch': batch}
+                    # train_loader.rl_num_nodes = len(batch['coords'])
+                    # model = strggrnn(inputs=[args, out_graph, graph, out_sess, data_loader, train_loader.frame_pointer])
+                    model = strggrnn(inputs=[args, out_graph, graph, cust_dataloader, (batch_idx * args.pred_len), False])
+                    model.fit()
+
+                    eager_assess = tf.function(assess_rcmndr)
+                    tf.config.run_functions_eagerly(True)
+                    ade_bst, fde_bst, min_idx = eager_assess(args.pred_len,
+                                                             model.rl_num_nodes, model.all_pred_path,
+                                                             model.nri_obj.target_traj0_ten,
+                                                             model=model, n_proposals=model.nri_obj.n_proposals)
+                    np_ade_bst = ade_bst.numpy()
+                    np_fde_bst = fde_bst.numpy()
+                    print('Val ADE = ', np_ade_bst)
+                    print('Val FDE = ', np_fde_bst)
+                    preds = torch.tensor(model.all_pred_path[min_idx].numpy())
+                    preds = preds.permute(2, 1, 0)
+                    t_gt_future = torch.tensor(model.nri_obj.target_traj0_ten.numpy())
+                    preds = torch.add(preds[:len(t_gt_future)], t_gt_future)
+                    num_of_agents = model.rl_num_nodes
+
+                    total_ade[0] += num_of_agents * torch.mean(
+                        F.pairwise_distance(preds[:, :20].contiguous().view(-1, 2),
+                                            batch['future_coords'][:, :20].contiguous().view(-1, 2))).item()
+
+                    total_fde[0] += torch.sum(F.pairwise_distance(preds[:, 19].reshape(-1, 2),
+                                                                  batch['future_coords'][:, 19].reshape(-1, 2))).item()
+                    num_nodes += num_of_agents
+
+                if best_val > total_ade[1] / num_nodes:
+                    best_val = total_ade[1] / num_nodes
+                    ckpt.step.assign_add(1)
+                    ckpt_saver.checkpoint.save(checkpoint_number=(e * batch_idx))
+            except TypeError:
+                pass
+
+        # log_f.close()
+        # sess.close()
+        # time_log.close()
+        log_count_f.close()
+        log_dir.close()
+        log_dir_fde.close()
+    else:
+        # inference mode (testing)
+        with open(parent_dir+'Sirius_json/test_agents.json') as f:
+            test = json.load(f)
+
+        results = {k: {} for k in test.keys()}
+
+        data = TrajectoryDataset(parent_dir+'Sirius_json/', 'test')
+
+        test_data_loader = DataLoader(
+            data,
+            batch_size=64,
+            num_workers=2,
+            collate_fn=torch_collate_fn,
+            shuffle=False,
+        )
+
+        print('Predicting and preparation of the submission file')
+        ckpt_reader = tf.train.load_checkpoint(save_dir+'ggrnn_best_val-2405')
+        bst_model = ckpt_reader.get_variable_to_dtype_map()
+        krnl_mdl_vals = []
+
+        for k in bst_model.keys():
+            if re.match('krnl_mdl*', k):
+                print(k)
+                krnl_mdl_vals.append(tf.convert_to_tensor(ckpt_reader.get_tensor(k)))
+
+        try:
+            enum_traj = enumerate(test_data_loader)
+            for batch_idx, batch in enum_traj:
+                cust_dataloader = {'train_loaderobj': test_data_loader, 'batch': batch}
+
+                # data_loader = {'train_loaderobj': cust_dataloader, 'batch': batch}
+                # train_loader.rl_num_nodes = len(batch['coords'])
+                # model = strggrnn(inputs=[args, out_graph, graph, out_sess, data_loader, train_loader.frame_pointer])
+                model = strggrnn(inputs=[args, out_graph, graph, cust_dataloader, (batch_idx * args.pred_len), infer])
+                model.bst_krnl_mdl_vals = krnl_mdl_vals
+                model.fit(infer)
+
+                # eager_assess = tf.function(assess_rcmndr)
+                # tf.config.run_functions_eagerly(True)
+                # ade_bst, fde_bst, min_idx = eager_assess(args.pred_len,
+                #                                          model.rl_num_nodes, model.all_pred_path,
+                #                                          model.nri_obj.target_traj0_ten,
+                #                                          model=model, n_proposals=model.nri_obj.n_proposals)
+                # np_ade_bst = ade_bst.numpy()
+                # np_fde_bst = fde_bst.numpy()
+                # print('Test ADE = ', np_ade_bst)
+                # print('Test FDE = ', np_fde_bst)
+
+                preds = torch.tensor(model.all_pred_path.numpy())
+                preds = preds.permute(2, 1, 0)
+                # batch['coords'][:] = preds[:, NUM_OF_PREDS - 20:]
+                # t_gt_future = torch.tensor(model.nri_obj.target_traj0_ten.numpy())
+                # preds = torch.add(preds[:len(t_gt_future)], t_gt_future)
+                # num_of_agents = model.rl_num_nodes
+                #
+                # total_ade[0] += num_of_agents * torch.mean(
+                #     F.pairwise_distance(preds[:, :20].contiguous().view(-1, 2),
+                #                         batch['future_coords'][:, :20].contiguous().view(-1, 2))).item()
+                #
+                # total_fde[0] += torch.sum(F.pairwise_distance(preds[:, 19].reshape(-1, 2),
+                #                                               batch['future_coords'][:, 19].reshape(-1, 2))).item()
+                # num_nodes += num_of_agents
+                preds_short = preds[:, :args.pred_len]
+                preds_medium = preds[:, :args.pred_len*2:args.pred_frame_hop*2]
+                preds_long = preds[:, :args.pred_len*4:args.pred_frame_hop*4]
+
+                for i, (scene, agent) in enumerate(zip(batch['scene_id'][:, 0], batch['track_id'][:, 0])):
+                    scene = int(scene.item())
+                    agent = int(agent.item())
+                    if agent in test[str(scene)]:
+                        results[str(scene)][agent] = {}
+                        results[str(scene)][agent]['short'] = preds_short[i].tolist()
+                        results[str(scene)][agent]['medium'] = preds_medium[i].tolist()
+                        results[str(scene)][agent]['long'] = preds_long[i].tolist()
+
+        except TypeError:
+            pass
+
+        # with torch.no_grad():
+        #     for batch in tqdm(data_loader):
+        #         batch = to_gpu(batch)
+        #         preds = CNN_Model(batch)
+        #         batch['coords'][:] = preds[:, NUM_OF_PREDS - 20:]
+        #         preds2 = CNN_Model(batch)
+        #         preds = torch.cat((preds, preds2), 1)
+        print('Dump predictions to CNN_Submit.json')
+        with open(parent_dir + 'STR_GGRNN_Submit.json', 'w') as f:
+            json.dump(results, f)
+
 # out_sess.close()
 
-
-def train(args):
-    out_graph = tf.Graph()
-    # tf.enable_eager_execution()
-    tf.compat.v1.disable_v2_behavior()
-    # tf.compat.v1.enable_eager_execution()
-    with out_graph.as_default():
-        STRGGRNN_model_train(out_graph, args)
-    out_graph.close()
-
-def main():
-    # sys.argv = ['-f']
-    args = parse.ArgsParser()
-    train(args.parser.parse_args())
-    return
 
 
 if __name__ == '__main__':
