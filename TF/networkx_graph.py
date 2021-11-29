@@ -29,14 +29,14 @@ class online_graph():
         self.edges = [{}]
         self.onlineGraph = Graph(self.diff, self.pred_diff)
 
-    def ConstructGraph(self, current_batch, future_traj, framenum, stateful=True, valid=False):
+    def ConstructGraph(self, current_batch, vislets, future_traj, framenum, stateful=True, valid=False):
         self.onlineGraph.step = framenum
 
         if valid:
             for pedID, itr in enumerate(current_batch):
                 node_id = pedID
                 node_pos_list = current_batch[pedID][int(framenum*self.ratio):int(framenum*self.ratio) + self.diff]  # * self.diff
-                node = Node(node_id, node_pos_list)
+                node = Node(node_id, node_pos_list, vislets)
                 # if framenum > 0 and framenum % 8:
                 #     node.setTargets(seq=future_traj[pedID])
                 self.onlineGraph.setNodes(itr, node)
@@ -47,7 +47,7 @@ class online_graph():
                 try:
                     node_pos_list = current_batch[idx][int(framenum*self.ratio):int(framenum*self.ratio) + self.diff]  # * self.diff
                     node_id = pedID = idx #current_batch['track_id']
-                    node = Node(node_id, node_pos_list)
+                    node = Node(node_id, node_pos_list, vislets[idx][int(framenum*self.ratio):int(framenum*self.ratio) + self.diff])
                     if not valid:
                         try:
                             if future_traj[pedID].shape[0] < 1:
@@ -56,9 +56,12 @@ class online_graph():
                                 node.setTargets(future_traj[pedID])
                             else:
                                 node.setTargets(seq=future_traj[pedID][framenum:framenum + self.pred_diff])
+                            self.onlineGraph.setNodes(itr, node)
                         except KeyError:
                             continue
-                    self.onlineGraph.setNodes(itr, node)
+                        except IndexError:
+                            pass
+
                 except KeyError:
                     key = list(current_batch.keys())
                     node_pos_list = current_batch[key[0]]
@@ -122,7 +125,8 @@ class Graph(nx.Graph):
                           node_pos_list=tf.concat((node.pos, tf.zeros(shape=(abs(node.pos.shape[0] - self.diff), 2))), axis=0), #len(node.pos)
                           state=node.state,
                           cell=node.cell,
-                          targets=tf.concat((node.targets[0], tf.reshape(r_target, (int(len(r_target)/2),2))), axis=0),
+                          targets=tf.concat((node.targets[0], tf.reshape(r_target, (int(len(r_target)/2), 2))), axis=0),
+                          vislets=tf.concat((node.vislet, tf.zeros(shape=(abs(node.vislet.shape[0] - self.diff), 2))), axis=0),
                           vel=node.vel)
 
     def setEdges(self, framenum , obj ,u,v=None, mode='t'):
@@ -152,7 +156,7 @@ class Graph(nx.Graph):
         #     self.edges.append([])
 
 class Node():
-    def __init__(self, node_id, node_pos_list):
+    def __init__(self, node_id, node_pos_list, vislet=None):
         self.id = node_id
         # if len(self.pos):
         self.pos = node_pos_list
@@ -160,6 +164,10 @@ class Node():
         self.cell = torch.zeros(batch_size, 256)
         self.seq = []
         self.targets = []
+        if not vislet is None:
+            self.vislet = vislet
+        else:
+            self.vislet = []
         self.vel = 0
 
     def setState(self, state, cell):
@@ -188,6 +196,7 @@ class Node():
                 'state': self.state,
                 'cell': self.cell,
                 'targets': self.targets,
+                'vislet': self.vislet,
                 'vel': self.vel
                 }
 

@@ -58,9 +58,11 @@ class nri_learned():
         # adj = np.ones(shape=(h_comp.shape[0], h_comp.shape[0]))
         adj = np.ones(shape=(num_nodes_sc, num_nodes_sc), dtype=np.float32)
         adj_mat_vec = np.zeros(shape=(self.n_proposals, adj.shape[0], adj.shape[1]), dtype=np.float32)
-        h_comp = np.array(h_comp, dtype=np.float32)
-        w = np.array(w, dtype=np.float32)
-        
+        h_comp = np.abs(np.array(h_comp, dtype=np.float32))
+        w = np.abs(np.array(w, dtype=np.float32)) / np.max(w)
+
+        w = np.pad(w, [[1, 1], [1, 1]], mode='minimum')
+        h_comp = np.pad(h_comp, [[1, 1], [1, 1]], mode='minimum')
         # print('Adjacency matrix length:{}'.format(num_nodes_sc))
         # coord = tf.train.Coordinator()
         # threads = tf.train.start_queue_runners(coord=coord)
@@ -72,13 +74,13 @@ class nri_learned():
         # finally:
         #     coord.request_stop()
         #     coord.join(threads)
-        # w = np.pad(w , [[1,1],[1,1]], mode='minimum')
+
         for k in range(self.n_proposals):
             # TODO see if map_fn applicable for online nmf
             w, h, n_iter = sk_dec.non_negative_factorization(X=adj, H=w, W=h_comp, init='custom',
                                                              n_components=adj.shape[0])
-            adj_mat = np.matmul(w, h)
-            adj_mat_vec[k] = adj_mat
+            # adj_mat = np.matmul(w, h)
+            adj_mat_vec[k] = w
         # edges = gumbel_softmax(logits, tau=args.temp, hard=args.hard)
         # prob = my_softmax(logits, -1)
         # loss_kl = kl_categorical_uniform(prob, args.num_atoms, edge_types)

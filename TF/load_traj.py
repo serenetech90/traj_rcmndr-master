@@ -7,8 +7,9 @@ import os
 import json
 import threading
 from multiprocessing import Process
-import glob
 from multiprocessing import Pool
+from matplotlib.pyplot import imread
+from glob import glob
 
 # import torch
 import tensorflow as tf
@@ -44,7 +45,19 @@ class DataLoader():
         # '/fakepath/Documents/self-growing-spatial-graph/self-growing-gru-offline_avgPool/data'
         # '/Data/stanford_campus_dataset/annotations/'
         # List of data directories where world-coordinates data is stored
-        self.used_data_dir = self.parent_dir + 'train/'
+        if infer:
+            self.used_data_dir = self.parent_dir + 'train/' + "{0}.csv".format(leave)
+            self.trajfilename = self.parent_dir + 'train/' + '/val_ggrnnv_trajectories_{0}_0.cpkl'.format(leave)
+        else:
+            self.used_data_dir = self.parent_dir + 'train/'
+            self.trajfilename = self.used_data_dir + '/ggrnnv_trajectories_{0}_1.cpkl'.format(leave)
+            files = self.used_data_dir + "*.csv"  # '*.json'
+            data_files = sorted(glob(files))
+            data_files.remove(self.used_data_dir + str(leave) + '.csv')
+            # by default remove non-vislet datasets
+            data_files.remove(self.used_data_dir + '0.csv')
+            data_files.remove(self.used_data_dir + '1.csv')
+
         self.infer = infer
         self.num_workers = 6
         # Number of datasets
@@ -54,9 +67,15 @@ class DataLoader():
         self.data_dir =self.parent_dir
         
         self.traj_batch = {}
+        self.traj_vislet = {}
         self.targets = {}
+        self.img_key = []
+        self.snapshot = {}
+
 
         # Store the arguments
+        self.args = args
+        self.lambda_param = args.lambda_param
         self.batch_size = args.batch_size
         self.seq_length = args.seq_length
         self.pred_len = args.pred_len
@@ -64,20 +83,20 @@ class DataLoader():
         self.gt_diff = args.gt_frame_hop
         self.pred_diff = args.pred_frame_hop
         self.min_max_coords = [0,0,0,0]
+        self.dim = int(args.neighborhood_size / args.grid_size)
+        self._2dconv_in = tf.zeros(shape=(self.dim, self.dim))
         # Validation arguments
         # self.val_fraction = 0.2
         # Define the path in which the process data would be stored
         # self.current_dir = self.used_data_dirs[start]
         # self.frame_pointer = self.seed
-        self.trajfilename = self.used_data_dir + '/trajectories_{0}_1.cpkl'.format(leave)
-        if infer:
-            self.trajfilename = self.used_data_dir + '/val_trajectories_{0}_0.cpkl'.format(leave)
 
         self.dataset_pointer = start
+        # data_files = self.used_data_dir + "{0}.csv".format(leave)  # '*.json'
+        # data_files = sorted(glob.glob(files))
+        # data_files.remove(self.used_data_dir + str(leave) + '.csv')
+
         if os.path.isdir(self.used_data_dir):
-            files = self.used_data_dir + "*.csv"  # '*.json'
-            data_files = sorted(glob.glob(files))
-            data_files.remove(self.used_data_dir + str(leave)+'.csv')
             # if sel is None:
             #     if len(data_files) > 1:
             #         print([x for x in range(len(data_files))])
@@ -102,9 +121,9 @@ class DataLoader():
         self.load_trajectories(self.sel_file)
         # Load the processed data from the pickle file
         # self.sel_file =  + name
-        self.num_batches = int((len(self.raw_data)/self.seq_length)/self.batch_size)
 
     def frame_preprocess(self, data_files=None, seed=0, infer=False):
+
         '''
         Function that will pre-process the pixel_pos.csv files of each dataset
         into data with occupancy grid that can be used
@@ -120,12 +139,16 @@ class DataLoader():
         def _read(p, s, e, return_dict):
             for frame_pointer, ele in enumerate(self.frameList[s:e]):
                 # print('Dataset frames snippet read between frames {} and {}'.format(minf, maxf))
-                for (ind, ped, pos_x, pos_y) in self.pedsPerFrameList[s:e]:
+                for (ind, ped, pos_x, pos_y, v_x, v_y) in self.pedsPerFrameList[s:e]:
                     if ind == ele:
+                        if ped not in x.keys():
+                            x[ped] = {}
                         try:
-                            x[ped].append([pos_x, pos_y])
+                            x[ped]['gt_traj'].append([pos_x, pos_y])
+                            x[ped]['gt_vis'].append([v_x, v_y])
                         except KeyError:
-                            x[ped] = [[pos_x, pos_y]]
+                            x[ped]['gt_traj'] = [[pos_x, pos_y]]
+                            x[ped]['gt_vis'] = [[v_x, v_y]]
 
                     # return_dict['x_' + str(int(ele))] = x
                     # if not 'x_'+str(int(ele)) in return_dict.keys():
@@ -136,7 +159,9 @@ class DataLoader():
                     #     return_dict['x_' + str(int(ele))].update({ped: x[ped]})
                     # else:
                     #     return_dict['x_' + str(int(ele))][ped].append(x[ped])
+
                 # print('Frame count {}, Read index = {}, and Max frame is {}, at Process {}'.format(frame_pointer, ele, maxf, p))
+
             return_dict['x'] = x
             print('Process {} finished'.format(p))
 
@@ -221,26 +246,99 @@ class DataLoader():
         self.raw_data = {}
         self.tr_data = []
 
-        for idx_f, f in enumerate(data_files):
-            f = open(f, 'rb')
-            self.raw_data[idx_f] = np.genfromtxt(fname=f, delimiter=',')  # remove
+        if not val:
+            for idx_f, f in enumerate(data_files):
+                self.img_key.append(f.split('.')[0][-1])
+                ctxt_img = glob(self.parent_dir + '/train/' + 'ctxt_{}.png'.format(self.img_key[-1]))[0]
+                ctxt_img = tf.convert_to_tensor(imread(ctxt_img), dtype=tf.float32)
+
+                ctxt_img_pd = tf.convert_to_tensor(tf.pad(ctxt_img, paddings=tf.constant([[1, 1, ], [0, 1], [0, 0]])),
+                                                   dtype=tf.float32)
+
+                ctxt_img_pd = tf.expand_dims(ctxt_img_pd, axis=0)
+                width = ctxt_img_pd.shape[1]
+                height = ctxt_img_pd.shape[2]
+                if ctxt_img_pd.shape[3] == 3:
+                    _2dconv = tf.nn.conv2d(input=ctxt_img_pd,
+                                           filters=tf.keras.initializers.truncated_normal()(
+                                               shape=[width - self.dim + 1,
+                                                      height - self.dim + 1, 3, 1],
+                                               dtype=tf.float32),
+                                       padding='VALID', strides=[1, 1, 1, 1])
+                elif ctxt_img_pd.shape[3] == 4:
+                    _2dconv = tf.nn.conv2d(input=ctxt_img_pd,
+                                           filters=tf.keras.initializers.truncated_normal()(
+                                               shape=[width - self.dim + 1,
+                                                      height - self.dim + 1, 4, 1],
+                                               dtype=tf.float32),
+                                       padding='VALID', strides=[1, 1, 1, 1])
+
+                _2dconv = tf.squeeze(_2dconv)
+                # _2dconv = self.lambda_param * _2dconv
+
+                self.snapshot[self.img_key[-1]] = {'snapshot': _2dconv, 'snapshot_fname': ctxt_img_pd, 'idx_read': [], 'width': width, 'height': height}
+                self._2dconv_in += _2dconv
+
+                f = open(f, 'rb')
+                self.raw_data[idx_f] = np.genfromtxt(fname=f, delimiter=',')  # remove
+                f.close()
+
+            rawOD = self.raw_data
+            keys = list(rawOD.keys())
+            keys = random.sample(keys, len(keys))
+            for k in keys:
+                self.raw_data[k] = rawOD[k][0:6]
+
+            for _, k in enumerate(keys):
+                if _ == 0:
+                    self.tr_data = self.raw_data[k]
+                else:
+                    self.tr_data = np.concatenate((self.tr_data, self.raw_data[k]), axis=1)
+
+        else:
+            f = open(data_files, 'rb')
+            self.raw_data = np.genfromtxt(fname=f, delimiter=',')  # remove
             f.close()
+            self.tr_data = self.raw_data[0:6]
+            self.img_key.append(str(self.args.leaveDataset))
+            ctxt_img = glob(self.parent_dir + '/train/' + 'ctxt_{}.png'.format(self.img_key[-1]))[0]
+            ctxt_img = tf.convert_to_tensor(imread(ctxt_img), dtype=tf.float32)
+
+            ctxt_img_pd = tf.convert_to_tensor(tf.pad(ctxt_img, paddings=tf.constant([[1, 1, ], [0, 1], [0, 0]])),
+                                               dtype=tf.float32)
+
+            ctxt_img_pd = tf.expand_dims(ctxt_img_pd, axis=0)
+            width = ctxt_img_pd.shape[1]
+            height = ctxt_img_pd.shape[2]
+            if ctxt_img_pd.shape[3] == 3:
+                _2dconv = tf.nn.conv2d(input=ctxt_img_pd,
+                                       filters=tf.keras.initializers.random_normal()(
+                                           shape=[width - self.dim + 1,
+                                                  height - self.dim + 1, 3, 1],
+                                           dtype=tf.float32),
+                                       padding='VALID', strides=[1, 1, 1, 1])
+            elif ctxt_img_pd.shape[3] == 4:
+                _2dconv = tf.nn.conv2d(input=ctxt_img_pd,
+                                       filters=tf.keras.initializers.random_normal()(
+                                           shape=[width - self.dim + 1,
+                                                  height - self.dim + 1, 4, 1],
+                                           dtype=tf.float32),
+                                       padding='VALID', strides=[1, 1, 1, 1])
+
+            _2dconv = tf.squeeze(_2dconv)
+            _2dconv += self.lambda_param * _2dconv
+
+            self.snapshot[self.img_key[-1]] = {'snapshot': _2dconv, 'snapshot_fname': ctxt_img_pd, 'idx_read': [],
+                                               'width': width, 'height': height}
+            self._2dconv_in += _2dconv
+            self._2dconv_in = self.snapshot[str(self.args.leaveDataset)]['snapshot']
+
+        self._2dconv_in += tf.expand_dims(
+            tf.range(start=0, limit=1, delta=(1 / self.args.obs_len), dtype=tf.float32), axis=0)
         # Get all the data from the pickle file
         # self.data = self.raw_data[:,2:4]
 
         # Randomize order of trajectories across the datasets
-        rawOD = self.raw_data
-        keys = list(rawOD.keys())
-        keys = random.sample(keys, len(keys))
-        for k in keys:
-            self.raw_data[k] = rawOD[k][0:4]
-
-        for _, k in enumerate(keys):
-            if _ == 0:
-                self.tr_data = self.raw_data[k]
-            else:
-                self.tr_data = np.concatenate((self.tr_data, self.raw_data[k]), axis=1)
-
         self.len = len(self.tr_data)
         self.max = int(self.tr_data.shape[1] * 0.7)  #
         self.val_max = int(self.tr_data.shape[1] * 0.3)
@@ -250,18 +348,22 @@ class DataLoader():
         if not val:
             self.frameList = self.tr_data[0, :]
 
-            self.pedsPerFrameList = self.tr_data[0:4, :]
-            # self.vislet = self.tr_data[4:6, :]
+            self.pedsPerFrameList = self.tr_data[0:6, :]
+            self.vislet = self.tr_data[4:6, :]
 
             self.seed = self.frameList[0]
             self.frame_pointer = int(self.seed)
+            self.num_batches = int((self.max / self.seq_length) / self.batch_size)
         else:
             self.frameList = self.val_data[0, :]
 
-            self.pedsPerFrameList = self.val_data[0:4, :]
-            # self.vislet = self.val_data[4:6, :]
+            self.pedsPerFrameList = self.val_data[0:6, :]
+            self.vislet = self.val_data[4:6, :]
+
             self.seed = self.frameList[0]
-            self.frame_pointer = int(self.seed)
+            self.frame_pointer = 0 #int(self.seed)
+
+            self.num_batches = int((self.val_max / self.seq_length) / self.batch_size)
 
         self.max_frame = max(self.frameList)
         self.pedIDs = self.pedsPerFrameList[1, :]
@@ -281,12 +383,10 @@ class DataLoader():
         #                 self.raw_data[k] = df[k]["coords"]
         #         # print("Completed reading JSON file {}".format(json_df.name))
         #         json_df.close()
-
-
-            # jsonf = open(csv_json_f, 'w')
-            # json_wr = csv.writer(jsonf, delimiter=',')
-            # json_wr.writerows(list(self.tr_data.items()))
-            # jsonf.close()
+        # jsonf = open(csv_json_f, 'w')
+        # json_wr = csv.writer(jsonf, delimiter=',')
+        # json_wr.writerows(list(self.tr_data.items()))
+        # jsonf.close()
         # else:
         #     self.raw_data = dict({str(k):ast.literal_eval(v) for (k,v) in pandas.read_csv(csv_json_f, delimiter=',').values})
 
@@ -305,15 +405,18 @@ class DataLoader():
             for pid, ptraj in self.trajectories['x'].items():
                 try:
                     # pid = str2int(pid)
-                    gt_obs_traj = tf.convert_to_tensor(ptraj[(b * self.frame_pointer):(b * self.frame_pointer) + self.obs_len], dtype=tf.float32)
+                    gt_obs_traj = tf.convert_to_tensor(ptraj['gt_traj'][(b * self.frame_pointer):(b * self.frame_pointer) + self.obs_len], dtype=tf.float32)
+                    gt_vislets = tf.convert_to_tensor(ptraj['gt_vis'][(b * self.frame_pointer):(b * self.frame_pointer) + self.obs_len], dtype=tf.float32)
                     # gt_obs_traj = self.tr_data[pid][(b * self.frame_pointer):(b * self.frame_pointer) + self.obs_len]
                     # if len(gt_obs_traj) > 0:
                     if gt_obs_traj.shape[0] > 0:
                         if pid not in self.traj_batch.keys():
                             self.traj_batch.update({pid: gt_obs_traj})
+                            self.traj_vislet.update({pid: gt_vislets})
                         else:
                             # print(self.traj_batch[int(pid)].shape, gt_obs_traj.shape, pid)
                             self.traj_batch[pid] = tf.concat((self.traj_batch[pid], gt_obs_traj), axis=0)
+                            self.traj_vislet[pid] = tf.concat((self.traj_vislet[pid], gt_vislets), axis=0)
 
                 except KeyError:
                     pass
@@ -323,7 +426,7 @@ class DataLoader():
             for idx_c in self.traj_batch.keys():
                 # gt_future_traj = self.tr_data[idx_c][self.frame_pointer:self.frame_pointer + self.pred_len]
                 # try:
-                gt_future_traj = tf.convert_to_tensor(self.trajectories['x'][idx_c][self.frame_pointer:self.frame_pointer + self.pred_len],
+                gt_future_traj = tf.convert_to_tensor(self.trajectories['x'][idx_c]['gt_traj'][self.frame_pointer:self.frame_pointer + self.pred_len],
                                                       dtype=tf.float32)
                 # except IndexError:
                 #     end = len(self.trajectories['x'][idx_c]) - 1
@@ -351,12 +454,13 @@ class DataLoader():
         if not valid:
             self.frame_pointer += hop
 
-    def reset_data_pointer(self, valid=False, dataset_pointer=0, frame_pointer=0):
+    def reset_data_pointer(self, valid=False, dataset_pointer=0, frame_pointer=None):
         '''
         Reset all pointers
         '''
-        if not valid:
-            self.frame_pointer = frame_pointer
-        else:
-            self.dataset_pointer = dataset_pointer
+        # if not valid:
+        #     self.frame_pointer = frame_pointer
+        # else:
+        self.dataset_pointer = dataset_pointer
+        if frame_pointer:
             self.frame_pointer = frame_pointer

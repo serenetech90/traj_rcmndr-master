@@ -56,7 +56,6 @@ class neighborhood_stat_vis_loc_encoder():
 
         # self.forward()
 
-
     def update_input_size(self, new_size):
         self.input = tf.compat.v1.placeholder(dtype=tf.float64, shape=[new_size, new_size], name="inputs")
         self.hidden_state = tf.compat.v1.placeholder(name='hidden_state', shape=(new_size, self.hidden_size), dtype=tf.float64)
@@ -66,7 +65,7 @@ class neighborhood_stat_vis_loc_encoder():
         # hidden state should be [2 x num_nodes x rnn_size x rnn_size]
         inputs, state_f00_b00_c, stat_input, stat_hidden_state = kwargs.values()
         (self.stat_output, self.stat_c_hidden_states) = self.stat_rnn(stat_input, stat_hidden_state)
-        (self.output, self.c_hidden_state) = self.rnn(inputs=inputs, state=state_f00_b00_c)
+        (self.output, self.c_hidden_state) = self.rnn(inputs=tf.transpose(inputs), state=state_f00_b00_c)
 
         return self.stat_output, self.stat_c_hidden_states, self.output, self.c_hidden_state
 
